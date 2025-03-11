@@ -50,6 +50,17 @@ def init_db(connection):
 
 
 def analyse(cursor):
+
+    res_follows_null = cursor.execute(
+        """SELECT COUNT(*) FROM post WHERE follows IS NULL"""
+    )
+    follows_null = res_follows_null.fetchall()
+    print(f"Number of null follows: {follows_null}")
+
+    res_plays_null = cursor.execute("""SELECT COUNT(*) FROM post WHERE plays IS NULL""")
+    plays_null = res_plays_null.fetchall()
+    print(f"Number of null plays: {plays_null}")
+
     post_types_res = cursor.execute(
         """
         SELECT 
@@ -57,6 +68,9 @@ def analyse(cursor):
             COUNT(*) as number_of_posts,
             AVG(impressions),
             AVG(likes),
+            AVG(shares),
+            AVG(follows),
+            AVG(saves)
         FROM post
         GROUP BY post_type
     """

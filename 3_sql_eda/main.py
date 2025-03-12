@@ -18,7 +18,7 @@ def init_db(connection):
             id INTEGER PRIMARY KEY,
             description TEXT NOT NULL,
             duration INTEGER NOT NULL,
-            publish_time DATETIME NOT NULL,
+            publish_time TEXT NOT NULL,
             permalink VARCHAR(50) NOT NULL CHECK(LENGTH(permalink) <= 50),
             post_type VARCHAR(30) NOT NULL CHECK(LENGTH(post_type) <= 30),
             data_comment VARCHAR(100) CHECK(data_comment IS NULL or LENGTH(data_comment) <= 100),
@@ -35,6 +35,7 @@ def init_db(connection):
     """
     )
     df = pd.read_csv(CSV_PATH, index_col=0)
+    df["Publish time"] = pd.to_datetime(df["Publish time"]).astype(str)
     data = list(df.itertuples(index=True, name=None))
 
     assert len(data) > 1, "Data file is empty"
@@ -51,6 +52,7 @@ def analyse_posts(cursor):
     nb_posts = cursor.execute("""SELECT COUNT(*) as count FROM post""").fetchone()[
         "count"
     ]
+    print(f"There are {nb_posts} posts.")
 
     follows_null = cursor.execute(
         """SELECT COUNT(*) as nb_null_follows FROM post WHERE follows IS NULL"""
@@ -67,23 +69,6 @@ def analyse_posts(cursor):
     ).fetchone()["nb_null_comment"]
     print(f"Number of null data comments: {data_comment_null} out of {nb_posts} posts")
 
-    post_stats = cursor.execute(
-        """ SELECT
-            post_type,
-            impressions,
-            likes,
-            1000*likes / NULLIF(impressions, 0) as rel_likes,
-            1000*shares / NULLIF(impressions, 0) as rel_shares,
-            1000*follows / NULLIF(impressions, 0) as rel_follows,
-            1000*reach / NULLIF(impressions, 0) as rel_reach,
-            1000*saves / NULLIF(impressions, 0) as rel_saves
-            FROM post
-            ORDER BY impressions DESC, rel_likes DESC
-        """
-    ).fetchall()
-
-    return post_stats
-
 
 def analyse_posts_by_type(cursor):
 
@@ -91,23 +76,7 @@ def analyse_posts_by_type(cursor):
         """
         SELECT 
             post_type, 
-            COUNT(*) as nb_posts,
-            AVG(impressions) as mean_impressions,
-            MIN(impressions) as min_impressions,
-            MAX(impressions) as max_impressions,
-            SUM(likes / impressions) / COUNT(*) as rel_likes,
-            AVG(likes) as mean_likes,
-            MIN(likes) as min_likes,
-            MAX(likes) as max_likes,
-            MIN(shares) as min_shares,
-            MAX(shares) as max_shares,
-            AVG(shares) as mean_shares,
-            MIN(follows) as min_follows,
-            MAX(follows) as max_follows,
-            AVG(follows) as mean_follows,
-            MIN(saves) as min_saves,
-            MAX(saves) as max_saves,
-            AVG(saves) as mean_saves
+            COUNT(*) as nb_posts
         FROM post
         GROUP BY post_type
         ORDER BY nb_posts ASC
@@ -117,41 +86,107 @@ def analyse_posts_by_type(cursor):
     return post_type_stats
 
 
-def get_outliers(cursor):
+def get_post_distribution(cursor):
     """
     Outliers are values that fall outside of 1.5 times the range between the first and third quartile.
     """
-    quartile_breaks = cursor.execute(
-        """ 
-        SELECT
-            impr_quartile,
-            MAX(impressions) AS quartile_break
-        FROM(
+
+    params = {
+        "impressions": "impressions",
+        "likes*1000 / impressions": "1000*likes / NULLIF(impressions, 0)",
+        "shares*1000 / impressions": "1000*shares / NULLIF(impressions, 0)",
+        "follows*1000 / impressions": "1000*follows / NULLIF(impressions, 0)",
+        "reach*1000 / impressions": "1000*reach / NULLIF(impressions, 0)",
+    }
+    all_quartiles = dict()
+    for key, param in params.items():
+        quartile_breaks = cursor.execute(
+            f""" 
             SELECT
-                impressions,
-                NTILE(4) OVER (ORDER BY impressions) AS impr_quartile
-            FROM post) AS quartiles
-        WHERE impr_quartile IN (1, 3)
-        GROUP BY impr_quartile
+                param_quartile,
+                MAX(param) AS quartile_break
+            FROM(
+                SELECT
+                    {param} as param,
+                    NTILE(4) OVER (ORDER BY {param}) AS param_quartile
+                FROM post) AS quartiles
+            GROUP BY param_quartile
+            """
+        ).fetchall()
+
+        quartile_breaks_by_type = cursor.execute(
+            f""" 
+            SELECT
+                param_quartile,
+                post_type,
+                MAX(param) AS quartile_break
+            FROM(
+                SELECT
+                    {param} as param,
+                    post_type,
+                    NTILE(4) OVER (PARTITION BY post_type ORDER BY post_type, {param}) AS param_quartile
+                FROM post) AS quartiles
+            WHERE param_quartile IN (1,2,3)
+            GROUP BY post_type, param_quartile
+            """
+        ).fetchall()
+
+        # List of [names, q1s, medians, q3s, lowerfences, upperfences]
+        quartiles = [
+            ["all"],  # names
+            [
+                t["quartile_break"] for t in quartile_breaks if t["param_quartile"] == 1
+            ],  # q1
+            [
+                t["quartile_break"] for t in quartile_breaks if t["param_quartile"] == 2
+            ],  # median
+            [
+                t["quartile_break"] for t in quartile_breaks if t["param_quartile"] == 3
+            ],  # q3
+            [],  # lowerfence
+            [],  # upperfence
+        ]
+        for item in quartile_breaks_by_type:
+            if item["param_quartile"] == 1:
+                quartiles[0].append(item["post_type"])
+            assert (
+                quartiles[0][-1] == item["post_type"]
+            )  # extra precaution to ensure we are on the right post type
+            quartiles[item["param_quartile"]].append(item["quartile_break"])
+
+        # calculate lower and upper fences
+        quartiles[4] = [
+            q1 - (q3 - q1) * 1.5 for q1, q3 in zip(quartiles[1], quartiles[3])
+        ]
+        quartiles[5] = [
+            q3 + (q3 - q1) * 1.5 for q1, q3 in zip(quartiles[1], quartiles[3])
+        ]
+
+        # only calculated for all posts, not by post type
+        outliers = cursor.execute(
+            f"""SELECT {param} as param
+                FROM post
+                WHERE {param} < ? OR {param} > ? ORDER BY param ASC""",
+            (quartiles[4][0], quartiles[5][0]),
+        ).fetchall()
+        print(f"{len(outliers)} outliers for the parameter {param}.")
+
+        all_quartiles[key] = quartiles
+
+    return all_quartiles
+
+
+def get_date_impact(cursor):
+    return cursor.execute(
+        """SELECT 
+                DATE(publish_time) AS publish,
+                SUM(impressions) AS total_impressions,
+                SUM(likes) AS total_likes
+            FROM post
+            GROUP BY publish
+            ORDER BY publish ASC;
         """
     ).fetchall()
-    print(quartile_breaks)
-    # [{'impr_quartile': 1, 'quartile_break': 13452}, {'impr_quartile': 3, 'quartile_break': 28918}]
-
-    lower_bound = quartile_breaks[0]["quartile_break"]
-    upper_bound = quartile_breaks[1]["quartile_break"]
-    iqr = (upper_bound - lower_bound) * 1.5
-    lower = lower_bound - iqr
-    upper = upper_bound + iqr
-
-    outliers = cursor.execute(
-        """SELECT *
-                                FROM post
-                                WHERE impressions < ? OR impressions > ?""",
-        (lower, upper),
-    ).fetchall()
-    print(len(outliers))
-    return outliers
 
 
 def dict_factory(cursor, row):
@@ -168,27 +203,22 @@ def main():
     init_db(connection)
 
     cursor = connection.cursor()
-    post_stats = analyse_posts(cursor)
+    analyse_posts(cursor)
     post_type_stats = analyse_posts_by_type(cursor)
-    outliers = get_outliers(cursor)
+    all_quartiles = get_post_distribution(cursor)
+    date_data = get_date_impact(cursor)
     cursor.close()
 
     fig = make_subplots(
-        rows=2,
-        cols=6,
+        rows=3,
+        cols=3,
         subplot_titles=[
             "Number of posts",
-            "Mean number of impressions",
-            "Mean number of likes",
-            "Mean number of shares",
-            "Mean number of follows",
-            "Mean number of saves",
-            "",
-            "Number of impressions",
-            "Relative number of likes per impression (*1000)",
-            "Relative number of shares per impression (*1000)",
-            "Relative number of follows per impression (*1000)",
-            "Relative number of saves per impression (*1000)",
+        ]
+        + [f"Distribution of {name}" for name in all_quartiles.keys()]
+        + [
+            "Number of impressions per publishing date",
+            "Number of likes per publishing date",
         ],
     )
     # Count of posts
@@ -196,101 +226,43 @@ def main():
         go.Bar(
             x=[t["post_type"] for t in post_type_stats],
             y=[t["nb_posts"] for t in post_type_stats],
+            name="Number of posts",
         ),
         row=1,
         col=1,
     )
-    # Average impressions
+    for idx, (name, quartiles) in enumerate(all_quartiles.items()):
+        fig.add_trace(
+            go.Box(
+                x=quartiles[0],
+                q1=quartiles[1],
+                median=quartiles[2],
+                q3=quartiles[3],
+                lowerfence=quartiles[4],
+                upperfence=quartiles[5],
+                name=f"{name} Quartiles",
+            ),
+            row=((idx + 1) // 3) + 1,
+            col=(idx + 1) % 3 + 1,
+        )
     fig.add_trace(
         go.Bar(
-            x=[t["post_type"] for t in post_type_stats],
-            y=[t["mean_impressions"] for t in post_type_stats],
+            x=[item["publish"] for item in date_data],
+            y=[item["total_impressions"] for item in date_data],
+            name="Impressions per day",
         ),
-        row=1,
+        row=3,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=[item["publish"] for item in date_data],
+            y=[item["total_likes"] for item in date_data],
+            name="Likes per day",
+        ),
+        row=3,
         col=2,
     )
-    fig.add_trace(
-        go.Bar(
-            x=[t["post_type"] for t in post_type_stats],
-            y=[t["mean_likes"] for t in post_type_stats],
-        ),
-        row=1,
-        col=3,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=[t["post_type"] for t in post_type_stats],
-            y=[t["mean_shares"] for t in post_type_stats],
-        ),
-        row=1,
-        col=4,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=[t["post_type"] for t in post_type_stats],
-            y=[t["mean_follows"] for t in post_type_stats],
-        ),
-        row=1,
-        col=5,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=[t["post_type"] for t in post_type_stats],
-            y=[t["mean_saves"] for t in post_type_stats],
-        ),
-        row=1,
-        col=6,
-    )
-
-    # Average impressions
-    color_dict = {"IG image": "blue", "IG reel": "red", "IG carousel": "green"}
-    colors: list[str] = [color_dict[t["post_type"]] for t in post_stats]
-    fig.add_trace(
-        go.Bar(
-            x=list(range(len(post_stats))),
-            y=[t["impressions"] for t in post_stats],
-            marker_color=colors,
-        ),
-        row=2,
-        col=2,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=list(range(len(post_stats))),
-            y=[t["rel_likes"] for t in post_stats],
-            marker_color=colors,
-        ),
-        row=2,
-        col=3,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=list(range(len(post_stats))),
-            y=[t["rel_shares"] for t in post_stats],
-            marker_color=colors,
-        ),
-        row=2,
-        col=4,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=list(range(len(post_stats))),
-            y=[t["rel_follows"] for t in post_stats],
-            marker_color=colors,
-        ),
-        row=2,
-        col=5,
-    )
-    fig.add_trace(
-        go.Bar(
-            x=list(range(len(post_stats))),
-            y=[t["rel_saves"] for t in post_stats],
-            marker_color=colors,
-        ),
-        row=2,
-        col=6,
-    )
-
     fig.show()
 
     connection.close()

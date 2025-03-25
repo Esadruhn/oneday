@@ -1,14 +1,15 @@
-import numpy as np
-import cv2
-from PIL import Image
-import onnxruntime as rt
 import pathlib
+import math
+import cv2
 
-from flask import Flask, flash, request, redirect, send_file
+import numpy as np
+import onnxruntime as rt
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-import cv2
+from PIL import Image, ImageDraw
+from io import BytesIO
+from flask import Flask, flash, request, redirect, send_file, Response
 
 
 MODEL_PATH = pathlib.Path(__file__).parent.resolve() / "data" / "MaskRCNN-12-qdq.onnx"
@@ -23,33 +24,6 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1000 * 1000
 
 def allowed_file(filename: str):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-@app.route("/", methods=["GET", "POST"])
-def upload_file():
-    if request.method == "POST":
-        # check if the post request has the file part
-        if "file" not in request.files:
-            flash("No file part")
-            return redirect(request.url)
-        file = request.files["file"]
-        # If the user does not select a file, the browser submits an
-        # empty file without a filename.
-        if file.filename == "":
-            flash("No selected file")
-            return redirect(request.url)
-        if file and allowed_file(file.filename):
-            response = predict(file=file)
-            return response, 200
-    return """
-    <!doctype html>
-    <title>Upload new File</title>
-    <h1>Upload new File</h1>
-    <form method=post enctype=multipart/form-data>
-      <input type=file name=file>
-      <input type=submit value=Upload>
-    </form>
-    """
 
 
 def preprocess(image):
@@ -71,7 +45,6 @@ def preprocess(image):
         image[i, :, :] = image[i, :, :] - mean_vec[i]
 
     # Pad to be divisible of 32
-    import math
 
     padded_h = int(math.ceil(image.shape[1] / 32) * 32)
     padded_w = int(math.ceil(image.shape[2] / 32) * 32)
@@ -159,8 +132,73 @@ def predict(file):
         masks=masks,
         file=OUTPUT_PATH,
     )
-
     return send_file(OUTPUT_PATH.as_posix(), mimetype="image/png")
+
+
+@app.route("/", methods=["GET", "POST"])
+def upload_file():
+    if request.method == "POST":
+        # check if the post request has the file part
+        if "file" not in request.files:
+            flash("No file part")
+            return redirect(request.url)
+        file = request.files["file"]
+        # If the user does not select a file, the browser submits an
+        # empty file without a filename.
+        if file.filename == "":
+            flash("No selected file")
+            return redirect(request.url)
+        if file and allowed_file(file.filename):
+            response = predict(file=file)
+            return response, 200
+    return """
+    <!doctype html>
+    <title>Upload new File</title>
+    <h1>Upload new File</h1>
+    <form method=post enctype=multipart/form-data>
+      <input type=file name=file>
+      <input type=submit value=Upload>
+    </form>
+    """
+
+
+@app.route("/favicon.ico")
+def favicon():
+    # Create a blank image with an alpha channel
+    image = Image.new("RGBA", (100, 100), (255, 255, 255, 0))
+
+    outer_radius = 25
+    inner_radius = 15
+    center_x = 50
+    center_y = 50
+    draw = ImageDraw.Draw(image)
+    draw.ellipse(
+        (
+            center_x - outer_radius,
+            center_y - outer_radius,
+            center_x + outer_radius,
+            center_y + outer_radius,
+        ),
+        fill="#4682b4",
+    )
+    draw.ellipse(
+        (
+            center_x - inner_radius,
+            center_y - inner_radius,
+            center_x + inner_radius,
+            center_y + inner_radius,
+        ),
+        fill="#fff",
+    )
+
+    image_version = image.resize((40, 40), resample=Image.BICUBIC)
+
+    buffer = BytesIO()
+    image_version.save(buffer, "ICO")
+    buffer.seek(0)
+    return Response(
+        buffer, mimetype="image/vnd.microsoft.icon", direct_passthrough=True
+    )
 
 
 if __name__ == "__main__":
